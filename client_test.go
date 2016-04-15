@@ -11,6 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func init() {
+	DefaultTimeout = 2 * time.Second
+}
+
 func randString() string {
 	b := make([]byte, 10)
 	if _, err := rand.Read(b); err != nil {
@@ -19,11 +23,20 @@ func randString() string {
 	return hex.EncodeToString(b)
 }
 
+func testClient() *Client {
+	c, err := New("localhost:4777", 1)
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
 func TestClient(t *T) {
-	c := New("localhost:4777")
-	q := randString()
 	assert := assert.New(t)
 	require := require.New(t)
+
+	c := testClient()
+	q := randString()
 
 	// Queue is currently empty, make sure PeekNext and PeekLast return nil
 	e, err := c.PeekNext(q)
@@ -54,11 +67,11 @@ func TestClient(t *T) {
 }
 
 func TestConsumer(t *T) {
-	c1, c2 := New("localhost:4777"), New("localhost:4777")
-	c1.Timeout = 2 * time.Second
-	q := randString()
 	assert := assert.New(t)
 	require := require.New(t)
+
+	c1, c2 := testClient(), testClient()
+	q := randString()
 
 	stopCh := make(chan bool)
 	workCh := make(chan bool)

@@ -2,16 +2,15 @@
 //
 // To import inside your package do:
 //
-//	import "github.com/mediocregopher/okq-go/okq"
+//	import "github.com/mediocregopher/okq-go.v2"
 //
 // Connecting
 //
-// Use New to create a Client. This Client can have knowledge of multiple okq
-// endpoints, and will attempt to reconnect at random if it loses connection. In
-// most cases it will only return an error if it can't connect to any of the
-// endpoints at that moment.
+// Most of the time you'll want to use New to make a new Client. This will
+// create a connection pool of the size given, and use that for all operation.
+// Client's are thread-safe.
 //
-//	cl := okq.New("127.0.0.1:4777", "127.0.0.1:4778")
+//	cl, err := okq.New("127.0.0.1:4777", 10)
 //
 // Pushing to queues
 //
@@ -48,10 +47,9 @@ package okq
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/grooveshark/golib/agg"
+	"github.com/mediocregopher/radix.v2/pool"
 	"github.com/mediocregopher/radix.v2/redis"
 	"github.com/pborman/uuid"
 )
@@ -64,6 +62,14 @@ func init() {
 			uuidCh <- uuid.New()
 		}
 	}()
+}
+
+// RedisPool is an interface which is implemented by radix.v2's pool.Pool type,
+// but can be easily implemented by other types if desired
+type RedisPool interface {
+	Get() (*redis.Client, error)
+	Put(*redis.Client)
+	Empty()
 }
 
 // PushFlag is passed into either of the Push commands to alter their behavior.
@@ -79,21 +85,16 @@ const (
 	// queue instead of the back
 	HighPriority
 
-	// NoBlock causes set the server to not wait for the event to be committed
-	// to disk before replying, it will reply as soon as it can and commit
+	// NoBlock causes the server to not wait for the event to be committed to
+	// disk before replying, it will reply as soon as it can and commit
 	// asynchronously
 	NoBlock
 )
 
-// DefaultTimeout is used when reading from socket
-const DefaultTimeout = 30 * time.Second
-
-// Notify timeout used in the consumer
-const notifyTimeout = time.Duration(float64(DefaultTimeout) * 0.9)
-
-// If true turns on debug logging and agg support (see
-// https://github.com/grooveshark/golib)
-var Debug bool
+// DefaultTimeout is used as the default timeout for reading from the redis
+// socket, and is used as the time to block per notify command for consumers.
+// This is only relevant if using the the New function
+var DefaultTimeout = 30 * time.Second
 
 // Event is a single event which can be read from or written to an okq instance
 type Event struct {
@@ -119,81 +120,48 @@ func replyToEvent(q string, r *redis.Resp) (*Event, error) {
 	}, nil
 }
 
-// Client is a client for the okq persistant queue. It can talk to a pool of okq
-// instances and failover from one to the other if one loses connectivity
+// Client is a client for the okq persistant queue which talks to a pool of okq
+// instances. A Client can be made manually if you have your own RedisPool you
+// want to use, but the New function can be used in most cases. If you are
+// making your own Client, note that NotifyTimeout is a required field if your
+// are going to be consuming with it
+//
+// All methods on Client are thread-safe.
 type Client struct {
-	clients map[string]*redis.Client
+	RedisPool
 
-	// Timeout to use for reads/writes to okq. This defaults to DefaultTimeout,
-	// but can be overwritten immediately after NewClient is called
-	Timeout time.Duration
+	// Required if Client is being made manually and is a consumer. This
+	// indicates the time to block on the connection waiting for new events.
+	// This should be equal to the read timeout on the redis connections
+	NotifyTimeout time.Duration
 }
 
-// New takes one or more okq endpoints (all in the same pool) and returns a
-// client which will interact with them. Returns an error if it can't connect to
-// any of the given clients
-func New(addr ...string) *Client {
-	c := Client{
-		clients: map[string]*redis.Client{},
-		Timeout: DefaultTimeout,
+// New takes in a redis address and creates a connection pool for it.
+// DefaultTimeout will be used for NotifyTimout.
+func New(addr string, numConns int) (*Client, error) {
+	df := func(network, addr string) (*redis.Client, error) {
+		return redis.DialTimeout(network, addr, DefaultTimeout)
 	}
 
-	for i := range addr {
-		c.clients[addr[i]] = nil
+	p, err := pool.NewCustom("tcp", addr, numConns, df)
+	if err != nil {
+		return nil, err
 	}
 
-	return &c
-}
-
-func (c *Client) getConn() (string, *redis.Client, error) {
-	for addr, rclient := range c.clients {
-		if rclient != nil {
-			return addr, rclient, nil
-		}
-	}
-
-	for addr := range c.clients {
-		rclient, err := redis.DialTimeout("tcp", addr, c.Timeout)
-		if err == nil {
-			c.clients[addr] = rclient
-			return addr, rclient, nil
-		}
-	}
-
-	return "", nil, errors.New("no connectable endpoints")
-}
-
-func doCmd(
-	rclient *redis.Client, cmd string, args ...interface{},
-) *redis.Resp {
-	start := time.Now()
-	r := rclient.Cmd(cmd, args...)
-	if Debug && r.Err == nil {
-		agg.Agg(strings.ToUpper(cmd), time.Since(start).Seconds())
-	}
-	return r
+	return &Client{
+		RedisPool:     p,
+		NotifyTimeout: DefaultTimeout,
+	}, nil
 }
 
 func (c *Client) cmd(cmd string, args ...interface{}) *redis.Resp {
-	for i := 0; i < 3; i++ {
-		addr, rclient, err := c.getConn()
-		if err != nil {
-			return redis.NewResp(err)
-		}
-
-		r := doCmd(rclient, cmd, args...)
-		if err := r.Err; err != nil {
-			if r.IsType(redis.IOErr) {
-				rclient.Close()
-				c.clients[addr] = nil
-				continue
-			}
-		}
-
-		return r
+	rclient, err := c.Get()
+	if err != nil {
+		return redis.NewResp(err)
 	}
+	defer c.Put(rclient)
 
-	return redis.NewResp(errors.New("could not find usable endpoint"))
+	return rclient.Cmd(cmd, args...)
 }
 
 // PeekNext returns the next event which will be retrieved from the queue,
@@ -239,6 +207,10 @@ func (c *Client) PushEvent(e *Event, f PushFlag) error {
 //
 //	cl.Push("queue", "not that important event", okq.NoBlock)
 //
+// Submit an important event, but do it as fast and unsafely as possibly (this
+// probably would never actually be wanted
+//
+//	cl.Push("queue", "not that important event", okq.HighPriority & okq.NoBlock)
 func (c *Client) Push(queue, contents string, f PushFlag) error {
 	event := Event{Queue: queue, ID: <-uuidCh, Contents: contents}
 	return c.PushEvent(&event, f)
@@ -294,31 +266,24 @@ func (c *Client) Status(queue ...string) ([]QueueStatus, error) {
 	return statuses, nil
 }
 
-// Close closes all connections that this client currently has open
+// Close closes all connections that this client currently has pooled. Should
+// only be called once all other commands and consumers are done running
 func (c *Client) Close() error {
-	var err error
-	for addr, rclient := range c.clients {
-		rerr := rclient.Close()
-		if err == nil && rerr != nil {
-			err = rerr
-		}
-		c.clients[addr] = nil
-	}
-	return err
+	c.Empty()
+	return nil
 }
 
-// ConsumerFunc is passed into Consume, and is used as a callback for incoming
+// ConsumerFunc is passed into Consumer, and is used as a callback for incoming
 // Events. It should return true if the event was processed successfully and
 // false otherwise. If ConsumerUnsafe is being used the return is ignored
 type ConsumerFunc func(*Event) bool
 
 // Consumer turns a client into a consumer. It will register itself on the given
 // queues, and call the ConsumerFunc on all events it comes across. If stopCh is
-// non-nil and is closed this will return immediately (unless blocking on a
-// QNOTIFY command, in which case it will return after that returns).
+// non-nil and is closed this will return ASAP.
 //
 // The ConsumerFunc is called synchronously, so if you wish to process events in
-// parallel you'll have to create multiple connections to okq
+// parallel you'll have to all it multiple times from multiple go routines
 func (c *Client) Consumer(
 	fn ConsumerFunc, stopCh chan bool, queues ...string,
 ) error {
@@ -341,26 +306,17 @@ func (c *Client) consumer(
 		return errors.New("no queues given to read from")
 	}
 
-	addr, rclient, err := c.getConn()
+	// Use slightly less than the actual read timeout on the tcp connections, so
+	// otherwise there's a slight race condition
+	notifyTimeout := int(time.Duration(float64(c.NotifyTimeout) * 0.9).Seconds())
+
+	rclient, err := c.Get()
 	if err != nil {
 		return err
 	}
+	defer c.Put(rclient)
 
-	// If we're returning and stopCh isn't closed it means there was some kind
-	// of connection error, and we should close the client.  It's possible that
-	// stopCh was closed AND there was a connection error, in that case the
-	// faulty connection will stay in c.clients, but it will be ferreted out the
-	// next time it tries to get used
-	defer func() {
-		select {
-		case <-stopCh:
-		default:
-			rclient.Close()
-			c.clients[addr] = nil
-		}
-	}()
-
-	if err := doCmd(rclient, "QREGISTER", queues).Err; err != nil {
+	if err := rclient.Cmd("QREGISTER", queues).Err; err != nil {
 		return err
 	}
 
@@ -371,7 +327,7 @@ func (c *Client) consumer(
 		default:
 		}
 
-		r := doCmd(rclient, "QNOTIFY", int(notifyTimeout.Seconds()))
+		r := rclient.Cmd("QNOTIFY", notifyTimeout)
 		if err := r.Err; err != nil {
 			return err
 		}
@@ -387,14 +343,10 @@ func (c *Client) consumer(
 
 		args := []string{q}
 		if noack {
-			// okq uses EX 0 to indicate that no qack is needed now, but it used
-			// to use NOACK. We send both for now for backwards compatibility.
-			// One day this may get in the way, so we'll have to take it out
 			args = append(args, "EX", "0")
-			args = append(args, "NOACK")
 		}
 
-		e, err := replyToEvent(q, doCmd(rclient, "QRPOP", args))
+		e, err := replyToEvent(q, rclient.Cmd("QRPOP", args))
 		if err != nil {
 			return err
 		} else if e == nil {
@@ -404,10 +356,11 @@ func (c *Client) consumer(
 		if noack {
 			go fn(e)
 			continue
-		}
-
-		if fn(e) {
-			doCmd(rclient, "QACK", q, e.ID)
+		} else if fn(e) {
+			// the return here doesn't matter, this is a best effort command. If
+			// the connection is closed we'll find out on the next QNOTIFY
+			// anyway
+			rclient.Cmd("QACK", q, e.ID)
 		}
 	}
 }
