@@ -32,7 +32,7 @@
 // return upon an error or a manual stop.
 //
 // Example of a consumer which should never quit
-//	fn := func(e *okq.Event) bool {
+//	fn := func(e okq.Event) bool {
 //		log.Printf("event received on %s: %s", e.Queue, e.Contents)
 //		return true
 //	}
@@ -103,17 +103,23 @@ type Event struct {
 	Contents string // Arbitrary contents of the event
 }
 
-func replyToEvent(q string, r *redis.Resp) (*Event, error) {
+// IsZero returns true if this is an empty Event (usually used as a return from
+// an empty queue)
+func (e Event) IsZero() bool {
+	return e == Event{}
+}
+
+func replyToEvent(q string, r *redis.Resp) (Event, error) {
 	if r.IsType(redis.Nil) {
-		return nil, nil
+		return Event{}, nil
 	}
 	parts, err := r.List()
 	if err != nil {
-		return nil, err
+		return Event{}, err
 	} else if len(parts) < 2 {
-		return nil, errors.New("not enough elements in reply")
+		return Event{}, errors.New("not enough elements in reply")
 	}
-	return &Event{
+	return Event{
 		Queue:    q,
 		ID:       parts[0],
 		Contents: parts[1],
@@ -165,21 +171,22 @@ func (c *Client) cmd(cmd string, args ...interface{}) *redis.Resp {
 }
 
 // PeekNext returns the next event which will be retrieved from the queue,
-// without actually removing it from the queue. Returns nil if the queue is
-// empty
-func (c *Client) PeekNext(queue string) (*Event, error) {
+// without actually removing it from the queue. Returns an empty Event (IsZero()
+// == true) if the queue is empty
+func (c *Client) PeekNext(queue string) (Event, error) {
 	return replyToEvent(queue, c.cmd("QRPEEK", queue))
 }
 
 // PeekLast returns the event most recently added to the queue, without actually
-// removing it from the queue. Returns nil if the queue is empty
-func (c *Client) PeekLast(queue string) (*Event, error) {
+// removing it from the queue. Returns an empty Event (IsZero() == true) if the
+// queue is empty
+func (c *Client) PeekLast(queue string) (Event, error) {
 	return replyToEvent(queue, c.cmd("QLPEEK", queue))
 }
 
 // PushEvent pushes the given event onto its queue. The event's Id must be
 // unique within that queue
-func (c *Client) PushEvent(e *Event, f PushFlag) error {
+func (c *Client) PushEvent(e Event, f PushFlag) error {
 	cmd := "QLPUSH"
 	if f&HighPriority > 0 {
 		cmd = "QRPUSH"
@@ -213,7 +220,7 @@ func (c *Client) PushEvent(e *Event, f PushFlag) error {
 //	cl.Push("queue", "not that important event", okq.HighPriority & okq.NoBlock)
 func (c *Client) Push(queue, contents string, f PushFlag) error {
 	event := Event{Queue: queue, ID: <-uuidCh, Contents: contents}
-	return c.PushEvent(&event, f)
+	return c.PushEvent(event, f)
 }
 
 // QueueStatus describes the current status for a single queue, as described by
@@ -276,7 +283,7 @@ func (c *Client) Close() error {
 // ConsumerFunc is passed into Consumer, and is used as a callback for incoming
 // Events. It should return true if the event was processed successfully and
 // false otherwise. If ConsumerUnsafe is being used the return is ignored
-type ConsumerFunc func(*Event) bool
+type ConsumerFunc func(Event) bool
 
 // Consumer turns a client into a consumer. It will register itself on the given
 // queues, and call the ConsumerFunc on all events it comes across. If stopCh is
@@ -349,7 +356,7 @@ func (c *Client) consumer(
 		e, err := replyToEvent(q, rclient.Cmd("QRPOP", args))
 		if err != nil {
 			return err
-		} else if e == nil {
+		} else if e.IsZero() {
 			continue
 		}
 

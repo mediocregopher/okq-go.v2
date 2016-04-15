@@ -41,11 +41,11 @@ func TestClient(t *T) {
 	// Queue is currently empty, make sure PeekNext and PeekLast return nil
 	e, err := c.PeekNext(q)
 	require.Nil(err)
-	assert.Nil(e)
+	assert.True(e.IsZero())
 
 	e, err = c.PeekLast(q)
 	require.Nil(err)
-	assert.Nil(e)
+	assert.True(e.IsZero())
 
 	// Add some items to the queue
 	require.Nil(c.Push(q, "foo", Normal))
@@ -77,7 +77,7 @@ func TestConsumer(t *T) {
 	workCh := make(chan bool)
 
 	i := 0
-	fn := func(e *Event) bool {
+	fn := func(e Event) bool {
 		assert.Equal(q, e.Queue)
 		assert.Equal(strconv.Itoa(i), e.Contents)
 		i++
