@@ -126,20 +126,60 @@ func replyToEvent(q string, r *redis.Resp) (Event, error) {
 	}, nil
 }
 
-// Client is a client for the okq persistant queue which talks to a pool of okq
-// instances. A Client can be made manually if you have your own RedisPool you
-// want to use, but the New function can be used in most cases. If you are
-// making your own Client, note that NotifyTimeout is a required field if your
-// are going to be consuming with it
+// Opts are various fields which can be used with NewWithOpts to create an okq
+// client. Only RedisPool is required.
+type Opts struct {
+	RedisPool
+
+	// Defaults to DefaultTimeout. This indicates the time a consumer should
+	// block on the connection waiting for new events. This should be equal to
+	// the read timeout on the redis connections.
+	NotifyTimeout time.Duration
+}
+
+// Client is a client for the okq persistent queue which talks to a pool of okq
+// instances.
 //
 // All methods on Client are thread-safe.
 type Client struct {
-	RedisPool
+	Opts
 
-	// Required if Client is being made manually and is a consumer. This
-	// indicates the time to block on the connection waiting for new events.
-	// This should be equal to the read timeout on the redis connections
-	NotifyTimeout time.Duration
+	closeCh chan bool
+}
+
+// NewWithOpts returns a new initialized Client based on the given Opts.
+// RedisPool is a required field in Opts.
+func NewWithOpts(o Opts) *Client {
+	if o.NotifyTimeout == 0 {
+		o.NotifyTimeout = DefaultTimeout
+	}
+	closeCh := make(chan bool)
+
+	// Start up a routine which will periodically ping connections in the pool
+	// to make sure they're alive. This ignores errors it gets, since its job is
+	// to root out the bad eggs, so errors are expected.
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-closeCh:
+				return
+			case <-t.C:
+				c, err := o.RedisPool.Get()
+				if err != nil {
+					continue
+				}
+				c.Cmd("PING")
+				o.RedisPool.Put(c)
+			}
+		}
+	}()
+
+	return &Client{
+		Opts:    o,
+		closeCh: closeCh,
+	}
 }
 
 // New takes in a redis address and creates a connection pool for it.
@@ -154,10 +194,9 @@ func New(addr string, numConns int) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{
-		RedisPool:     p,
-		NotifyTimeout: DefaultTimeout,
-	}, nil
+	return NewWithOpts(Opts{
+		RedisPool: p,
+	}), nil
 }
 
 func (c *Client) cmd(cmd string, args ...interface{}) *redis.Resp {
@@ -276,6 +315,10 @@ func (c *Client) Status(queue ...string) ([]QueueStatus, error) {
 // Close closes all connections that this client currently has pooled. Should
 // only be called once all other commands and consumers are done running
 func (c *Client) Close() error {
+	// We don't close the closeCh, since we want to sync with the ping routine
+	// to make sure it saw the close and isn't in the middle of pinging a
+	// connection
+	c.closeCh <- true
 	c.Empty()
 	return nil
 }
