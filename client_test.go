@@ -85,10 +85,7 @@ func TestConsumer(t *T) {
 		return true
 	}
 
-	retCh := make(chan error)
-	go func() {
-		retCh <- c1.Consumer(fn, stopCh, q)
-	}()
+	retCh := c1.Consumer(fn, stopCh, q)
 
 	for i := 0; i < 1000; i++ {
 		require.Nil(c2.Push(q, strconv.Itoa(i), Normal))
