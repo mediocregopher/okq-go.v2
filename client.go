@@ -28,8 +28,8 @@
 // Consuming from queues
 //
 // You can turn any Client into a consumer by using the Consumer methods. These
-// will block as they call the given function on incoming events, and only
-// return upon an error or a manual stop.
+// will return a channel which will block until an error is hit or a manual stop
+// occurs
 //
 // Example of a consumer which should never quit
 //	fn := func(e okq.Event) bool {
@@ -37,8 +37,8 @@
 //		return true
 //	}
 //	for {
-//		err := cl.Consumer(fn, nil, "queue1", "queue2")
-//		log.Printf("error received from consumer: %s", err)
+//		errCh := cl.Consumer(fn, nil, "queue1", "queue2")
+//		log.Printf("error received from consumer: %s", <-errCh)
 //	}
 //
 // See the doc string for the Consumer method for more details
@@ -329,15 +329,19 @@ func (c *Client) Close() error {
 type ConsumerFunc func(Event) bool
 
 // Consumer turns a client into a consumer. It will register itself on the given
-// queues, and call the ConsumerFunc on all events it comes across. If stopCh is
-// non-nil and is closed this will return ASAP.
+// queues, and call the ConsumerFunc on all events it comes across. It returns a
+// buffered error channel to which an error will be written when one is come
+// across. At that point Consumer must be called again.
+//
+// If stopCh is non-nil and is closed then nil will be written to the error
+// channel and consuming will stop.
 //
 // The ConsumerFunc is called synchronously, so if you wish to process events in
-// parallel you'll have to all it multiple times from multiple go routines
+// parallel you'll have to all it multiple times from multiple go routines.
 func (c *Client) Consumer(
 	fn ConsumerFunc, stopCh chan bool, queues ...string,
-) error {
-	return c.consumer(fn, stopCh, queues, false)
+) <-chan error {
+	return c.consumerOuter(fn, stopCh, queues, false)
 }
 
 // ConsumerUnsafe is the same as Consumer except that the given ConsumerFunc is
@@ -345,8 +349,19 @@ func (c *Client) Consumer(
 // ever sent to the okq server)
 func (c *Client) ConsumerUnsafe(
 	fn ConsumerFunc, stopCh chan bool, queues ...string,
-) error {
-	return c.consumer(fn, stopCh, queues, true)
+) <-chan error {
+	return c.consumerOuter(fn, stopCh, queues, true)
+}
+
+func (c *Client) consumerOuter(
+	fn ConsumerFunc, stopCh chan bool, queues []string, noack bool,
+) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.consumer(fn, stopCh, queues, noack)
+		close(errCh)
+	}()
+	return errCh
 }
 
 func (c *Client) consumer(
