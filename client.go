@@ -344,9 +344,8 @@ func (c *Client) Consumer(
 	return c.consumerOuter(fn, stopCh, queues, false)
 }
 
-// ConsumerUnsafe is the same as Consumer except that the given ConsumerFunc is
-// called asynchronously and its return value doesn't matter (because no QACK is
-// ever sent to the okq server)
+// ConsumerUnsafe is the same as Consumer except that the given ConsumerFunc's
+// return value doesn't matter (because no QACK is ever sent to the okq server)
 func (c *Client) ConsumerUnsafe(
 	fn ConsumerFunc, stopCh chan bool, queues ...string,
 ) <-chan error {
@@ -418,10 +417,7 @@ func (c *Client) consumer(
 			continue
 		}
 
-		if noack {
-			go fn(e)
-			continue
-		} else if fn(e) {
+		if ok := fn(e); ok && !noack {
 			// the return here doesn't matter, this is a best effort command. If
 			// the connection is closed we'll find out on the next QNOTIFY
 			// anyway
