@@ -387,7 +387,8 @@ func (c *Client) consumer(
 	for {
 		select {
 		case <-stopCh:
-			return nil
+			// unregister for all queues with an empty QREGISTER command
+			return rclient.Cmd("QREGISTER").Err
 		default:
 		}
 
