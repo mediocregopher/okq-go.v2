@@ -418,11 +418,18 @@ func (c *Client) consumer(
 			continue
 		}
 
-		if ok := fn(e); ok && !noack {
-			// the return here doesn't matter, this is a best effort command. If
+		ok := fn(e)
+		if noack {
+			// don't QACK
+		} else if ok {
+			// the return from QACKs doesn't matter, these are best effort. If
 			// the connection is closed we'll find out on the next QNOTIFY
 			// anyway
 			rclient.Cmd("QACK", q, e.ID)
+		} else {
+			// if there was an error we send the REDO param to immediately make
+			// the event available again.
+			rclient.Cmd("QACK", q, e.ID, "REDO")
 		}
 	}
 }
