@@ -45,8 +45,10 @@
 package okq
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/mediocregopher/radix.v2/pool"
@@ -325,48 +327,91 @@ func (c *Client) Close() error {
 
 // ConsumerFunc is passed into Consumer, and is used as a callback for incoming
 // Events. It should return true if the event was processed successfully and
-// false otherwise. If ConsumerUnsafe is being used the return is ignored
-type ConsumerFunc func(Event) bool
+// false otherwise.
+//
+// The Context will be canceled once the event's expire has been reached (as set
+// in ConsumerOpts ExpireSeconds field). If the expire is infinity it will never
+// be canceled
+type ConsumerFunc func(context.Context, Event) bool
 
-// Consumer turns a client into a consumer. It will register itself on the given
-// queues, and call the ConsumerFunc on all events it comes across. It returns a
-// buffered error channel to which an error will be written when one is come
-// across. At that point Consumer must be called again.
-//
-// If stopCh is non-nil and is closed then nil will be written to the error
-// channel and consuming will stop.
-//
-// The ConsumerFunc is called synchronously, so if you wish to process events in
-// parallel you'll have to all it multiple times from multiple go routines.
+// ConsumerOpts are the set of parameters that an okq consumer can run with
+type ConsumerOpts struct {
+	// Required, the queues to consume
+	Queues []string
+
+	// Required, the callback to call for every consumed event
+	Callback ConsumerFunc
+
+	// Optional, if set this can be closed to stop the consumer after it's
+	// completed its current job. The consumer will write nil to its error
+	// channel once it's done.
+	StopCh chan bool
+
+	// Optional (default 30), the number of seconds a consumed job has in order
+	// to be completed (i.e. Callback finishes running). If the event is not
+	// completed in time okq will put it back in the queue it came from,
+	// regardless of the status of the consumer.
+	//
+	// If -1 then the expire is effectively infinity and the event is never put
+	// back in the queue, regardless of what the Callback returns.
+	ExpireSeconds int
+}
+
+func (opts *ConsumerOpts) setDefaults() {
+	// This is a bit weird. An EX value of 0 is what okq considers to be the
+	// "infinity" expire, but we want 0 to mean "unset" and -1 to be
+	// "infinity".
+	if opts.ExpireSeconds == 0 {
+		opts.ExpireSeconds = 30
+	} else if opts.ExpireSeconds == -1 {
+		opts.ExpireSeconds = 0
+	}
+}
+
+// this assumes that setDefaults has been called already
+func (opts ConsumerOpts) eventCallback(e Event) bool {
+	ctx := context.Background()
+	if opts.ExpireSeconds > 0 {
+		expire := time.Duration(opts.ExpireSeconds) * time.Minute
+		var cancelFn context.CancelFunc
+		ctx, cancelFn = context.WithTimeout(ctx, expire)
+		defer cancelFn()
+	}
+
+	return opts.Callback(ctx, e)
+}
+
+// Consumer turns a client into a consumer, and is a shortcut around Consume.
 func (c *Client) Consumer(
 	fn ConsumerFunc, stopCh chan bool, queues ...string,
 ) <-chan error {
-	return c.consumerOuter(fn, stopCh, queues, false)
+	return c.Consume(ConsumerOpts{
+		Queues:   queues,
+		Callback: fn,
+		StopCh:   stopCh,
+	})
 }
 
-// ConsumerUnsafe is the same as Consumer except that the given ConsumerFunc's
-// return value doesn't matter (because no QACK is ever sent to the okq server)
-func (c *Client) ConsumerUnsafe(
-	fn ConsumerFunc, stopCh chan bool, queues ...string,
-) <-chan error {
-	return c.consumerOuter(fn, stopCh, queues, true)
-}
-
-func (c *Client) consumerOuter(
-	fn ConsumerFunc, stopCh chan bool, queues []string, noack bool,
-) <-chan error {
+// Consume turns a client into a consumer. It will register itself on the
+// Queues, and call the Callback on all events it comes across. It returns a
+// buffered error channel to which an error will be written when one is come
+// across. At that point Consumer must be called again.
+//
+// The Callback is called synchronously, so if you wish to process events in
+// parallel you'll have to call Consume multiple times from multiple go
+// routines.
+func (c *Client) Consume(opts ConsumerOpts) <-chan error {
+	opts.setDefaults()
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.consumer(fn, stopCh, queues, noack)
+		errCh <- c.consumer(opts)
 		close(errCh)
 	}()
 	return errCh
 }
 
-func (c *Client) consumer(
-	fn ConsumerFunc, stopCh chan bool, queues []string, noack bool,
-) error {
-	if len(queues) == 0 {
+func (c *Client) consumer(opts ConsumerOpts) error {
+	if len(opts.Queues) == 0 {
 		return errors.New("no queues given to read from")
 	}
 
@@ -380,13 +425,13 @@ func (c *Client) consumer(
 	}
 	defer c.Put(rclient)
 
-	if err := rclient.Cmd("QREGISTER", queues).Err; err != nil {
+	if err := rclient.Cmd("QREGISTER", opts.Queues).Err; err != nil {
 		return err
 	}
 
 	for {
 		select {
-		case <-stopCh:
+		case <-opts.StopCh:
 			// unregister for all queues with an empty QREGISTER command
 			return rclient.Cmd("QREGISTER").Err
 		default:
@@ -406,11 +451,7 @@ func (c *Client) consumer(
 			return err
 		}
 
-		args := []string{q}
-		if noack {
-			args = append(args, "EX", "0")
-		}
-
+		args := []string{q, "EX", strconv.Itoa(opts.ExpireSeconds)}
 		e, err := replyToEvent(q, rclient.Cmd("QRPOP", args))
 		if err != nil {
 			return err
@@ -418,9 +459,8 @@ func (c *Client) consumer(
 			continue
 		}
 
-		ok := fn(e)
-		if noack {
-			// don't QACK
+		if ok := opts.eventCallback(e); opts.ExpireSeconds == 0 {
+			// ExpireSeconds of 0 means QACK isn't necessary
 		} else if ok {
 			// the return from QACKs doesn't matter, these are best effort. If
 			// the connection is closed we'll find out on the next QNOTIFY
