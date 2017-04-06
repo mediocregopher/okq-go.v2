@@ -1,6 +1,7 @@
 package okq
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"strconv"
@@ -73,11 +74,11 @@ func TestConsumer(t *T) {
 	c1, c2 := testClient(), testClient()
 	q := randString()
 
-	stopCh := make(chan bool)
+	ctx, cancelFn := context.WithCancel(context.Background())
 	workCh := make(chan bool)
 
 	i := 0
-	fn := func(e Event) bool {
+	fn := func(ctx context.Context, e Event) bool {
 		assert.Equal(q, e.Queue)
 		assert.Equal(strconv.Itoa(i), e.Contents)
 		i++
@@ -85,15 +86,15 @@ func TestConsumer(t *T) {
 		return true
 	}
 
-	retCh := c1.Consumer(fn, stopCh, q)
+	retCh := c1.Consumer(ctx, fn, q)
 
 	for i := 0; i < 1000; i++ {
 		require.Nil(c2.Push(q, strconv.Itoa(i), Normal))
 		<-workCh
 	}
 
-	close(stopCh)
-	require.Nil(<-retCh)
+	cancelFn()
+	assert.Equal(context.Canceled, <-retCh)
 	require.Nil(c1.Close())
 
 	statuses, err := c2.Status(q)
