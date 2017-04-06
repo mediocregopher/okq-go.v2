@@ -32,12 +32,12 @@
 // occurs
 //
 // Example of a consumer which should never quit
-//	fn := func(e okq.Event) bool {
+//	fn := func(ctx context.Context, e okq.Event) bool {
 //		log.Printf("event received on %s: %s", e.Queue, e.Contents)
 //		return true
 //	}
 //	for {
-//		errCh := cl.Consumer(fn, nil, "queue1", "queue2")
+//		errCh := cl.Consumer(context.Background(), fn, nil, "queue1", "queue2")
 //		log.Printf("error received from consumer: %s", <-errCh)
 //	}
 //
@@ -51,6 +51,7 @@ import (
 	"strconv"
 	"time"
 
+	llog "github.com/levenlabs/go-llog"
 	"github.com/mediocregopher/radix.v2/pool"
 	"github.com/mediocregopher/radix.v2/redis"
 	"github.com/pborman/uuid"
@@ -330,8 +331,8 @@ func (c *Client) Close() error {
 // false otherwise.
 //
 // The Context will be canceled once the event's expire has been reached (as set
-// in ConsumerOpts ExpireSeconds field). If the expire is infinity it will never
-// be canceled
+// in ConsumerOpts ExpireSeconds field) or the base Context passed to Consume is
+// canceled.
 type ConsumerFunc func(context.Context, Event) bool
 
 // ConsumerOpts are the set of parameters that an okq consumer can run with
@@ -342,10 +343,11 @@ type ConsumerOpts struct {
 	// Required, the callback to call for every consumed event
 	Callback ConsumerFunc
 
-	// Optional, if set this can be closed to stop the consumer after it's
-	// completed its current job. The consumer will write nil to its error
-	// channel once it's done.
-	StopCh chan bool
+	// Optional, if set this can be canceled to stop the consumer after it's
+	// completed its current job. The consumer will write context.Canceled to
+	// its error channel once it's done. This same context (if set) will be used
+	// as the root Context for each call to Callback.
+	Context context.Context
 
 	// Optional (default 30), the number of seconds a consumed job has in order
 	// to be completed (i.e. Callback finishes running). If the event is not
@@ -354,10 +356,16 @@ type ConsumerOpts struct {
 	//
 	// If -1 then the expire is effectively infinity and the event is never put
 	// back in the queue, regardless of what the Callback returns.
+	//
+	// This timeout, if not -1, is also used to cancel the Context passed to the
+	// Callback
 	ExpireSeconds int
 }
 
 func (opts *ConsumerOpts) setDefaults() {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
 	// This is a bit weird. An EX value of 0 is what okq considers to be the
 	// "infinity" expire, but we want 0 to mean "unset" and -1 to be
 	// "infinity".
@@ -370,7 +378,7 @@ func (opts *ConsumerOpts) setDefaults() {
 
 // this assumes that setDefaults has been called already
 func (opts ConsumerOpts) eventCallback(e Event) bool {
-	ctx := context.Background()
+	ctx := opts.Context
 	if opts.ExpireSeconds > 0 {
 		expire := time.Duration(opts.ExpireSeconds) * time.Minute
 		var cancelFn context.CancelFunc
@@ -382,13 +390,11 @@ func (opts ConsumerOpts) eventCallback(e Event) bool {
 }
 
 // Consumer turns a client into a consumer, and is a shortcut around Consume.
-func (c *Client) Consumer(
-	fn ConsumerFunc, stopCh chan bool, queues ...string,
-) <-chan error {
+func (c *Client) Consumer(ctx context.Context, fn ConsumerFunc, queues ...string) <-chan error {
 	return c.Consume(ConsumerOpts{
 		Queues:   queues,
 		Callback: fn,
-		StopCh:   stopCh,
+		Context:  ctx,
 	})
 }
 
@@ -429,11 +435,15 @@ func (c *Client) consumer(opts ConsumerOpts) error {
 		return err
 	}
 
+	doneCh := opts.Context.Done()
 	for {
 		select {
-		case <-opts.StopCh:
+		case <-doneCh:
 			// unregister for all queues with an empty QREGISTER command
-			return rclient.Cmd("QREGISTER").Err
+			if err := rclient.Cmd("QREGISTER").Err; err != nil {
+				return err
+			}
+			return opts.Context.Err()
 		default:
 		}
 
@@ -471,5 +481,6 @@ func (c *Client) consumer(opts ConsumerOpts) error {
 			// the event available again.
 			rclient.Cmd("QACK", q, e.ID, "REDO")
 		}
+		llog.Debug("done processing job")
 	}
 }
