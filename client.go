@@ -51,7 +51,6 @@ import (
 	"strconv"
 	"time"
 
-	llog "github.com/levenlabs/go-llog"
 	"github.com/mediocregopher/radix.v2/pool"
 	"github.com/mediocregopher/radix.v2/redis"
 	"github.com/pborman/uuid"
@@ -481,6 +480,5 @@ func (c *Client) consumer(opts ConsumerOpts) error {
 			// the event available again.
 			rclient.Cmd("QACK", q, e.ID, "REDO")
 		}
-		llog.Debug("done processing job")
 	}
 }
