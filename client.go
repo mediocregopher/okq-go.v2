@@ -49,6 +49,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mediocregopher/radix.v2/pool"
@@ -97,6 +98,15 @@ const (
 // socket, and is used as the time to block per notify command for consumers.
 // This is only relevant if using the the New function
 var DefaultTimeout = 30 * time.Second
+
+// IsDup returns true if the error given was returned from okq for the case of
+// an event which was submitted being the duplicate of an existing one.
+func IsDup(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.HasPrefix(err.Error(), "ERR duplicate event")
+}
 
 // Event is a single event which can be read from or written to an okq instance
 type Event struct {
